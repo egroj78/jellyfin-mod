@@ -25,6 +25,12 @@ jobs:
         working-directory: upstream
         run: git apply --verbose ../jellyfin-firetv.patch
 
+      - name: Identificador propio (para no chocar con otras versiones de Jellyfin)
+        working-directory: upstream
+        run: |
+          sed -i 's/applicationIdSuffix = ".debug"/applicationIdSuffix = ".firetvmod"/' app/build.gradle.kts
+          grep -n "applicationIdSuffix" app/build.gradle.kts
+
       - name: Usar siempre la misma firma (para poder actualizar sin desinstalar)
         run: mkdir -p ~/.android && cp debug.keystore ~/.android/debug.keystore
 
