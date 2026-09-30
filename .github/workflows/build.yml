@@ -53,6 +53,12 @@ jobs:
           find upstream/app/build/outputs/apk -name "*.apk" -exec cp {} out/jellyfin-mod.apk \;
           ls -la out
 
+      - name: Firmar siempre con la misma clave (para poder actualizar sin desinstalar)
+        run: |
+          APKSIGNER=$(ls -d $ANDROID_HOME/build-tools/*/ | sort -V | tail -1)apksigner
+          $APKSIGNER sign --ks debug.keystore --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android out/jellyfin-mod.apk
+          $APKSIGNER verify --print-certs out/jellyfin-mod.apk | grep -i "SHA-256"
+
       - name: Publicar descarga
         uses: softprops/action-gh-release@v2
         with:
