@@ -1,28 +1,3 @@
-From f0091a0789db5a719e80a0eb906ccd9f67a85857 Mon Sep 17 00:00:00 2001
-From: Jorge <jorfebla@gmail.com>
-Date: Wed, 30 Sep 2026 16:00:45 +0200
-Subject: [PATCH] Fire TV: subtitle offset + media info in legacy player
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01PNcogTVKrtAusfNBpXR4AQ
----
- .../ui/playback/PlaybackController.java       |   5 +
- .../androidtv/ui/playback/SubtitleOffset.kt   | 155 +++++++++++++++
- .../androidtv/ui/playback/VideoManager.java   |   5 +-
- .../CustomPlaybackTransportControlGlue.java   |  12 ++
- .../overlay/action/MediaInfoAction.kt         | 181 ++++++++++++++++++
- .../overlay/action/SubtitleOffsetAction.kt    | 161 ++++++++++++++++
- app/src/main/res/drawable/ic_media_info.xml   |  10 +
- .../main/res/drawable/ic_subtitle_offset.xml  |  27 +++
- app/src/main/res/values-es/strings.xml        |   5 +
- app/src/main/res/values/strings.xml           |   7 +-
- 10 files changed, 566 insertions(+), 2 deletions(-)
- create mode 100644 app/src/main/java/org/jellyfin/androidtv/ui/playback/SubtitleOffset.kt
- create mode 100644 app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/MediaInfoAction.kt
- create mode 100644 app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/SubtitleOffsetAction.kt
- create mode 100644 app/src/main/res/drawable/ic_media_info.xml
- create mode 100644 app/src/main/res/drawable/ic_subtitle_offset.xml
-
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/PlaybackController.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/PlaybackController.java
 index c355349..0aa87bc 100644
 --- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/PlaybackController.java
@@ -41,10 +16,10 @@ index c355349..0aa87bc 100644
      }
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/SubtitleOffset.kt b/app/src/main/java/org/jellyfin/androidtv/ui/playback/SubtitleOffset.kt
 new file mode 100644
-index 0000000..6649e72
+index 0000000..8e9902d
 --- /dev/null
 +++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/SubtitleOffset.kt
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,198 @@
 +@file:OptIn(UnstableApi::class)
 +
 +package org.jellyfin.androidtv.ui.playback
@@ -53,9 +28,11 @@ index 0000000..6649e72
 +import androidx.annotation.OptIn
 +import androidx.media3.common.C
 +import androidx.media3.common.Format
++import androidx.media3.common.PlaybackParameters
 +import androidx.media3.common.Timeline
 +import androidx.media3.common.util.UnstableApi
 +import androidx.media3.exoplayer.ForwardingRenderer
++import androidx.media3.exoplayer.MediaClock
 +import androidx.media3.exoplayer.Renderer
 +import androidx.media3.exoplayer.RendererConfiguration
 +import androidx.media3.exoplayer.RenderersFactory
@@ -70,21 +47,20 @@ index 0000000..6649e72
 +import java.util.UUID
 +
 +/**
-+ * Holds the subtitle offset (a.k.a. subtitle delay) for the item that is currently playing.
-+ *
-+ * A positive value shows the subtitles later, a negative value shows them earlier.
++ * Holds a time offset (in milliseconds) for the item that is currently playing.
 + * The value is kept while the same item is playing (e.g. when switching quality or audio track)
 + * and reset to 0 when a different item starts.
 + */
-+object SubtitleOffset {
-+	const val SMALL_STEP_MS = 100L
-+	const val LARGE_STEP_MS = 1_000L
-+	private const val MAX_OFFSET_MS = 600_000L
++open class ItemOffset(
++	val smallStepMs: Long,
++	val largeStepMs: Long,
++) {
++	private val maxOffsetMs = 600_000L
 +
 +	@Volatile
 +	var offsetMs: Long = 0
 +		set(value) {
-+			field = value.coerceIn(-MAX_OFFSET_MS, MAX_OFFSET_MS)
++			field = value.coerceIn(-maxOffsetMs, maxOffsetMs)
 +		}
 +
 +	private var currentItemId: UUID? = null
@@ -102,13 +78,25 @@ index 0000000..6649e72
 +			offsetMs < 0 -> "−"
 +			else -> ""
 +		}
-+		return String.format(Locale.US, "%s%.1f s", sign, kotlin.math.abs(offsetMs) / 1000.0)
++		val decimals = if (offsetMs % 100 == 0L) 1 else 2
++		return String.format(Locale.US, "%s%.${decimals}f s", sign, kotlin.math.abs(offsetMs) / 1000.0)
 +	}
 +}
 +
 +/**
++ * Subtitle offset (a.k.a. subtitle delay). Positive values show the subtitles later.
++ */
++object SubtitleOffset : ItemOffset(smallStepMs = 100, largeStepMs = 1_000)
++
++/**
++ * Audio offset (a.k.a. audio delay / lip sync). Positive values play the audio later
++ * (the picture is shown earlier relative to the sound).
++ */
++object AudioOffset : ItemOffset(smallStepMs = 50, largeStepMs = 500)
++
++/**
 + * Wraps a [TextRenderer] and feeds it a shifted playback position so subtitles are displayed
-+ * [SubtitleOffset.offsetMs] later (or earlier when negative) without touching the media itself.
++ * the subtitle offset later (or earlier when negative) without touching the media itself.
 + * Changes to the offset apply immediately, no re-buffering needed.
 + */
 +class SubtitleOffsetRenderer(renderer: Renderer) : ForwardingRenderer(renderer) {
@@ -197,11 +185,41 @@ index 0000000..6649e72
 +		textRendererOutput,
 +		metadataRendererOutput,
 +	).map { renderer ->
-+		if (renderer is TextRenderer) SubtitleOffsetRenderer(renderer) else renderer
++		when {
++			renderer is TextRenderer -> SubtitleOffsetRenderer(renderer)
++			renderer.trackType == C.TRACK_TYPE_AUDIO && renderer.mediaClock != null -> AudioOffsetRenderer(renderer)
++			else -> renderer
++		}
 +	}.toTypedArray()
 +}
++
++/**
++ * Wraps the audio renderer (which drives the playback clock) and shifts the clock it reports by
++ * [AudioOffset.offsetMs]. Video frames follow that clock, so a positive offset shows the picture
++ * earlier relative to the sound, i.e. the audio is delayed. Changes apply immediately.
++ */
++class AudioOffsetRenderer(private val renderer: Renderer) : ForwardingRenderer(renderer) {
++	private val offsetClock = object : MediaClock {
++		override fun getPositionUs(): Long {
++			val clock = renderer.mediaClock ?: return 0
++			return clock.positionUs + AudioOffset.offsetMs * 1_000L
++		}
++
++		override fun hasSkippedSilenceSinceLastCall(): Boolean =
++			renderer.mediaClock?.hasSkippedSilenceSinceLastCall() ?: false
++
++		override fun setPlaybackParameters(playbackParameters: PlaybackParameters) {
++			renderer.mediaClock?.setPlaybackParameters(playbackParameters)
++		}
++
++		override fun getPlaybackParameters(): PlaybackParameters =
++			renderer.mediaClock?.playbackParameters ?: PlaybackParameters.DEFAULT
++	}
++
++	override fun getMediaClock(): MediaClock? = if (renderer.mediaClock != null) offsetClock else null
++}
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
-index 1b6a281..99cb088 100644
+index 1b6a281..4bf42e2 100644
 --- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
 +++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
 @@ -218,7 +218,7 @@ public class VideoManager {
@@ -213,21 +231,29 @@ index 1b6a281..99cb088 100644
          exoPlayerBuilder.setMediaSourceFactory(new DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory));
  
          exoPlayerBuilder.setAudioAttributes(new AudioAttributes.Builder()
-@@ -351,6 +351,9 @@ public class VideoManager {
+@@ -351,6 +351,10 @@ public class VideoManager {
          }
          Timber.i("Video path set to: %s", path);
  
 +        // Keep the subtitle offset while the same item is playing, reset it for a new item
 +        SubtitleOffset.INSTANCE.onItemStarted(streamInfo.getItemId());
++        AudioOffset.INSTANCE.onItemStarted(streamInfo.getItemId());
 +
          try {
              // Add external subtitles
              List<MediaItem.SubtitleConfiguration> subtitleConfigurations = new ArrayList<>();
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/CustomPlaybackTransportControlGlue.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/CustomPlaybackTransportControlGlue.java
-index 13eb115..d45d2e7 100644
+index 13eb115..fe17372 100644
 --- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/CustomPlaybackTransportControlGlue.java
 +++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/CustomPlaybackTransportControlGlue.java
-@@ -33,6 +33,7 @@ import org.jellyfin.androidtv.ui.playback.overlay.action.ClosedCaptionsAction;
+@@ -27,12 +27,14 @@ import org.jellyfin.androidtv.preference.UserPreferences;
+ import org.jellyfin.androidtv.preference.constant.ClockBehavior;
+ import org.jellyfin.androidtv.ui.playback.PlaybackController;
+ import org.jellyfin.androidtv.ui.playback.overlay.action.AndroidAction;
++import org.jellyfin.androidtv.ui.playback.overlay.action.AudioOffsetAction;
+ import org.jellyfin.androidtv.ui.playback.overlay.action.ChannelBarChannelAction;
+ import org.jellyfin.androidtv.ui.playback.overlay.action.ChapterAction;
+ import org.jellyfin.androidtv.ui.playback.overlay.action.ClosedCaptionsAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.CustomAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.FastForwardAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.GuideAction;
@@ -235,7 +261,7 @@ index 13eb115..d45d2e7 100644
  import org.jellyfin.androidtv.ui.playback.overlay.action.PlayPauseAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.PlaybackSpeedAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.PreviousLiveTvChannelAction;
-@@ -42,6 +43,7 @@ import org.jellyfin.androidtv.ui.playback.overlay.action.SelectAudioAction;
+@@ -42,6 +44,7 @@ import org.jellyfin.androidtv.ui.playback.overlay.action.SelectAudioAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.SelectQualityAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.SkipNextAction;
  import org.jellyfin.androidtv.ui.playback.overlay.action.SkipPreviousAction;
@@ -243,36 +269,40 @@ index 13eb115..d45d2e7 100644
  import org.jellyfin.androidtv.ui.playback.overlay.action.ZoomAction;
  import org.jellyfin.androidtv.util.DateTimeExtensionsKt;
  import org.koin.java.KoinJavaComponent;
-@@ -63,6 +65,8 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
+@@ -63,6 +66,9 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
      private PlaybackSpeedAction playbackSpeedAction;
      private ZoomAction zoomAction;
      private ChapterAction chapterAction;
 +    private SubtitleOffsetAction subtitleOffsetAction;
++    private AudioOffsetAction audioOffsetAction;
 +    private MediaInfoAction mediaInfoAction;
  
      // TV actions
      private PreviousLiveTvChannelAction previousLiveTvChannelAction;
-@@ -114,6 +118,8 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
+@@ -114,6 +120,9 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
          selectAudioAction.dismissPopup();
          selectQualityAction.dismissPopup();
          zoomAction.dismissPopup();
 +        subtitleOffsetAction.dismissPopup();
++        audioOffsetAction.dismissPopup();
 +        mediaInfoAction.dismissPopup();
  
          super.onDetachedFromHost();
      }
-@@ -204,6 +210,10 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
+@@ -204,6 +213,12 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
          zoomAction.setLabels(new String[]{context.getString(R.string.lbl_zoom)});
          chapterAction = new ChapterAction(context, this);
          chapterAction.setLabels(new String[]{context.getString(R.string.lbl_chapters)});
 +        subtitleOffsetAction = new SubtitleOffsetAction(context, this);
 +        subtitleOffsetAction.setLabels(new String[]{context.getString(R.string.lbl_subtitle_offset)});
++        audioOffsetAction = new AudioOffsetAction(context, this);
++        audioOffsetAction.setLabels(new String[]{context.getString(R.string.lbl_audio_offset)});
 +        mediaInfoAction = new MediaInfoAction(context, this);
 +        mediaInfoAction.setLabels(new String[]{context.getString(R.string.lbl_media_info)});
  
          previousLiveTvChannelAction = new PreviousLiveTvChannelAction(context, this);
          previousLiveTvChannelAction.setLabels(new String[]{context.getString(R.string.lbl_prev_item)});
-@@ -245,6 +255,7 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
+@@ -245,12 +260,17 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
  
          if (playerAdapter.hasSubs()) {
              primaryActionsAdapter.add(closedCaptionsAction);
@@ -280,7 +310,17 @@ index 13eb115..d45d2e7 100644
          }
  
          if (playerAdapter.hasMultiAudio()) {
-@@ -283,6 +294,7 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
+             primaryActionsAdapter.add(selectAudioAction);
+         }
+ 
++        if (!playerAdapter.isLiveTv()) {
++            primaryActionsAdapter.add(audioOffsetAction);
++        }
++
+         if (playerAdapter.isLiveTv()) {
+             primaryActionsAdapter.add(channelBarChannelAction);
+             primaryActionsAdapter.add(guideAction);
+@@ -283,6 +303,7 @@ public class CustomPlaybackTransportControlGlue extends PlaybackTransportControl
          }
  
          secondaryActionsAdapter.add(zoomAction);
@@ -290,10 +330,10 @@ index 13eb115..d45d2e7 100644
      @Override
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/MediaInfoAction.kt b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/MediaInfoAction.kt
 new file mode 100644
-index 0000000..4a1f85c
+index 0000000..47f0ad9
 --- /dev/null
 +++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/MediaInfoAction.kt
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,183 @@
 +package org.jellyfin.androidtv.ui.playback.overlay.action
 +
 +import android.app.AlertDialog
@@ -303,6 +343,7 @@ index 0000000..4a1f85c
 +import androidx.media3.common.util.UnstableApi
 +import org.jellyfin.androidtv.R
 +import org.jellyfin.androidtv.ui.playback.PlaybackController
++import org.jellyfin.androidtv.ui.playback.AudioOffset
 +import org.jellyfin.androidtv.ui.playback.SubtitleOffset
 +import org.jellyfin.androidtv.ui.playback.overlay.CustomPlaybackTransportControlGlue
 +import org.jellyfin.androidtv.ui.playback.overlay.VideoPlayerAdapter
@@ -407,6 +448,7 @@ index 0000000..4a1f85c
 +			appendLine("▸ ${listOfNotNull(audio.codec?.uppercase(), audio.profile, audio.channelLayout ?: audio.channels?.let { "$it ch" }).joinToString(" · ")}")
 +			audio.bitRate?.takeIf { it > 0 }?.let { appendLine("▸ Bitrate: ${formatBitrate(it)}") }
 +			audio.sampleRate?.let { appendLine("▸ Frecuencia: $it Hz") }
++			appendLine("▸ Desfase: ${AudioOffset.format()}")
 +		}
 +
 +		// Subtitles
@@ -477,10 +519,10 @@ index 0000000..4a1f85c
 +}
 diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/SubtitleOffsetAction.kt b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/SubtitleOffsetAction.kt
 new file mode 100644
-index 0000000..fe63772
+index 0000000..f391da1
 --- /dev/null
 +++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/overlay/action/SubtitleOffsetAction.kt
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,202 @@
 +package org.jellyfin.androidtv.ui.playback.overlay.action
 +
 +import android.content.Context
@@ -496,25 +538,64 @@ index 0000000..fe63772
 +import android.widget.LinearLayout
 +import android.widget.PopupWindow
 +import android.widget.TextView
++import androidx.annotation.DrawableRes
++import androidx.annotation.StringRes
 +import org.jellyfin.androidtv.R
 +import org.jellyfin.androidtv.ui.playback.PlaybackController
++import org.jellyfin.androidtv.ui.playback.AudioOffset
++import org.jellyfin.androidtv.ui.playback.ItemOffset
 +import org.jellyfin.androidtv.ui.playback.SubtitleOffset
 +import org.jellyfin.androidtv.ui.playback.overlay.CustomPlaybackTransportControlGlue
 +import org.jellyfin.androidtv.ui.playback.overlay.VideoPlayerAdapter
 +
 +/**
 + * Player action that opens a small panel to shift the subtitles in time
-+ * ("subtitle offset" / "subtitle delay"). The panel stays open while adjusting so the
-+ * result can be checked live; press Back to close it.
++ * ("subtitle offset" / "subtitle delay").
 + */
 +class SubtitleOffsetAction(
 +	context: Context,
 +	customPlaybackTransportControlGlue: CustomPlaybackTransportControlGlue,
++) : OffsetAction(
++	context,
++	customPlaybackTransportControlGlue,
++	iconRes = R.drawable.ic_subtitle_offset,
++	titleRes = R.string.lbl_subtitle_offset,
++	hintRes = R.string.lbl_subtitle_offset_hint,
++	offset = SubtitleOffset,
++)
++
++/**
++ * Player action that opens a small panel to shift the audio in time
++ * ("audio offset" / "audio delay" / lip sync).
++ */
++class AudioOffsetAction(
++	context: Context,
++	customPlaybackTransportControlGlue: CustomPlaybackTransportControlGlue,
++) : OffsetAction(
++	context,
++	customPlaybackTransportControlGlue,
++	iconRes = R.drawable.ic_audio_offset,
++	titleRes = R.string.lbl_audio_offset,
++	hintRes = R.string.lbl_audio_offset_hint,
++	offset = AudioOffset,
++)
++
++/**
++ * Base action that opens a small panel to adjust an [ItemOffset]. The panel stays open while
++ * adjusting so the result can be checked live; press Back to close it.
++ */
++open class OffsetAction(
++	context: Context,
++	customPlaybackTransportControlGlue: CustomPlaybackTransportControlGlue,
++	@DrawableRes iconRes: Int,
++	@StringRes private val titleRes: Int,
++	@StringRes private val hintRes: Int,
++	private val offset: ItemOffset,
 +) : CustomAction(context, customPlaybackTransportControlGlue) {
 +	private var popup: PopupWindow? = null
 +
 +	init {
-+		initializeWithIcon(R.drawable.ic_subtitle_offset)
++		initializeWithIcon(iconRes)
 +	}
 +
 +	override fun handleClickAction(
@@ -535,11 +616,11 @@ index 0000000..fe63772
 +			typeface = Typeface.DEFAULT_BOLD
 +			gravity = Gravity.CENTER
 +			minWidth = dp(110)
-+			text = SubtitleOffset.format()
++			text = offset.format()
 +		}
 +
 +		fun refresh() {
-+			valueView.text = SubtitleOffset.format()
++			valueView.text = offset.format()
 +		}
 +
 +		fun button(label: String, onClick: () -> Unit) = TextView(context).apply {
@@ -568,20 +649,22 @@ index 0000000..fe63772
 +		}
 +
 +		fun add(deltaMs: Long) {
-+			SubtitleOffset.offsetMs += deltaMs
++			offset.offsetMs += deltaMs
 +		}
 +
-+		val smallPlus = button("+0.1 s") { add(SubtitleOffset.SMALL_STEP_MS) }
++		val small = offset.smallStepMs
++		val large = offset.largeStepMs
++		val smallPlus = button(offset.format(small)) { add(small) }
 +
 +		val row = LinearLayout(context).apply {
 +			orientation = LinearLayout.HORIZONTAL
 +			gravity = Gravity.CENTER_VERTICAL
-+			addView(button("−1 s") { add(-SubtitleOffset.LARGE_STEP_MS) })
-+			addView(button("−0.1 s") { add(-SubtitleOffset.SMALL_STEP_MS) })
++			addView(button(offset.format(-large)) { add(-large) })
++			addView(button(offset.format(-small)) { add(-small) })
 +			addView(valueView)
 +			addView(smallPlus)
-+			addView(button("+1 s") { add(SubtitleOffset.LARGE_STEP_MS) })
-+			addView(button(context.getString(R.string.lbl_subtitle_offset_reset)) { SubtitleOffset.offsetMs = 0 })
++			addView(button(offset.format(large)) { add(large) })
++			addView(button(context.getString(R.string.lbl_subtitle_offset_reset)) { offset.offsetMs = 0 })
 +		}
 +
 +		val container = LinearLayout(context).apply {
@@ -594,14 +677,14 @@ index 0000000..fe63772
 +			}
 +
 +			addView(TextView(context).apply {
-+				text = context.getString(R.string.lbl_subtitle_offset)
++				text = context.getString(titleRes)
 +				setTextColor(Color.WHITE)
 +				textSize = 18f
 +				setPadding(0, 0, 0, dp(10))
 +			})
 +			addView(row)
 +			addView(TextView(context).apply {
-+				text = context.getString(R.string.lbl_subtitle_offset_hint)
++				text = context.getString(hintRes)
 +				setTextColor(Color.argb(180, 255, 255, 255))
 +				textSize = 13f
 +				setPadding(0, dp(10), 0, 0)
@@ -642,6 +725,39 @@ index 0000000..fe63772
 +		popup?.dismiss()
 +	}
 +}
+diff --git a/app/src/main/res/drawable/ic_audio_offset.xml b/app/src/main/res/drawable/ic_audio_offset.xml
+new file mode 100644
+index 0000000..2d2048d
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_audio_offset.xml
+@@ -0,0 +1,27 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:tint="#FFFFFF"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <!-- Speaker -->
++    <path
++        android:fillColor="@android:color/white"
++        android:pathData="M2,8.5h3l4,-3.5v13l-4,-3.5H2z" />
++    <!-- Sound wave -->
++    <path
++        android:strokeColor="@android:color/white"
++        android:strokeWidth="1.6"
++        android:strokeLineCap="round"
++        android:pathData="M11.5,9a4,4 0,0 1,0 5" />
++    <!-- Clock -->
++    <path
++        android:strokeColor="@android:color/white"
++        android:strokeWidth="1.6"
++        android:pathData="M17.5,17.5m-4.2,0a4.2,4.2 0,1 1,8.4 0a4.2,4.2 0,1 1,-8.4 0" />
++    <path
++        android:strokeColor="@android:color/white"
++        android:strokeWidth="1.4"
++        android:strokeLineCap="round"
++        android:pathData="M17.5,15.3v2.3l1.5,1" />
++</vector>
 diff --git a/app/src/main/res/drawable/ic_media_info.xml b/app/src/main/res/drawable/ic_media_info.xml
 new file mode 100644
 index 0000000..b08088e
@@ -692,21 +808,23 @@ index 0000000..05373b4
 +        android:pathData="M17.5,15.3v2.3l1.5,1" />
 +</vector>
 diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
-index 732c319..bac3fe5 100644
+index 732c319..3031731 100644
 --- a/app/src/main/res/values-es/strings.xml
 +++ b/app/src/main/res/values-es/strings.xml
-@@ -600,4 +600,9 @@
+@@ -600,4 +600,11 @@
      <string name="speech_error_unknown">Se produjo un error inesperado durante el reconocimiento de voz.</string>
      <string name="still_watching_label">¿Aún sigues ahí?</string>
      <string name="pref_subtitles_position">Posición desde abajo</string>
 +    <string name="lbl_subtitle_offset">Desfase de subtítulos</string>
 +    <string name="lbl_subtitle_offset_hint">+ retrasa los subtítulos · − los adelanta · Atrás para cerrar</string>
 +    <string name="lbl_subtitle_offset_reset">Restablecer</string>
++    <string name="lbl_audio_offset">Desfase de audio</string>
++    <string name="lbl_audio_offset_hint">+ retrasa el audio · − lo adelanta · Atrás para cerrar</string>
 +    <string name="lbl_media_info">Información del medio</string>
 +    <string name="lbl_media_info_close">Cerrar</string>
  </resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 117ea54..4091646 100644
+index 117ea54..d729e2a 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -1,7 +1,7 @@
@@ -718,16 +836,15 @@ index 117ea54..4091646 100644
      <string name="video_error_unknown_error">Failed to load video</string>
      <string name="loading">Loading…</string>
      <string name="btn_cancel">Cancel</string>
-@@ -590,4 +590,9 @@
+@@ -590,4 +590,11 @@
          <item quantity="one">%1$s album</item>
          <item quantity="other">%1$s albums</item>
      </plurals>
 +    <string name="lbl_subtitle_offset">Subtitle offset</string>
 +    <string name="lbl_subtitle_offset_hint">+ shows subtitles later · − shows them earlier · Back to close</string>
 +    <string name="lbl_subtitle_offset_reset">Reset</string>
++    <string name="lbl_audio_offset">Audio offset</string>
++    <string name="lbl_audio_offset_hint">+ plays the audio later · − plays it earlier · Back to close</string>
 +    <string name="lbl_media_info">Media info</string>
 +    <string name="lbl_media_info_close">Close</string>
  </resources>
--- 
-2.43.0
-
